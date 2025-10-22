@@ -1,0 +1,14 @@
+{
+  "name": "hyperion-electron",
+  "version": "1.0.0",
+  "description": "Electron shell for Hyperion POC",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "build": "npx electron-builder"
+  },
+  "devDependencies": {
+    "electron": "^30.0.0"
+  },
+  "dependencies": {}
+}

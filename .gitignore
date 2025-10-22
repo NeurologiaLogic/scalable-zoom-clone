@@ -1,0 +1,8 @@
+zoom/node_modules/
+zoom/server/node_modules/
+zoom/electron/node_modules/
+zoom/server/node_modules/socket.io/node_modules/
+# Ignore build outputs
+**/dist/
+**/win-unpacked/
+**/*.exe

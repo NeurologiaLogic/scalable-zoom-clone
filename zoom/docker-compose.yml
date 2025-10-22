@@ -1,0 +1,89 @@
+version: "3.8"
+
+services:
+  zookeeper:
+    image: wurstmeister/zookeeper:latest
+    ports:
+      - "2181:2181"
+    networks:
+      - hyperion_network
+
+  kafka1:
+    image: wurstmeister/kafka:latest
+    container_name: kafka1
+    ports:
+      - "9094:9094"  # Host port 9094 -> OUTSIDE listener
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENERS: INSIDE://kafka1:9092,OUTSIDE://kafka1:9094
+      KAFKA_ADVERTISED_LISTENERS: INSIDE://kafka1:9092,OUTSIDE://kafka1:9094
+      KAFKA_INTER_BROKER_LISTENER_NAME: INSIDE
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INSIDE:PLAINTEXT,OUTSIDE:PLAINTEXT
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
+    depends_on:
+      - zookeeper
+    networks:
+      - hyperion_network
+
+  signaling1:
+    build: ./server
+    environment:
+      NODE_ENV: development
+      INSTANCE_ID: 1
+    depends_on:
+      - kafka1
+    command: sh -c "./wait-for-it.sh kafka1:9094 -- node index.js"
+    networks:
+      - hyperion_network
+
+  # signaling2:
+  #   build: ./server
+  #   environment:
+  #     NODE_ENV: development
+  #     INSTANCE_ID: 2
+  #   depends_on:
+  #     - kafka1
+  #   command: sh -c "./wait-for-it.sh kafka1:9094 -- node index.js"
+  #   networks:
+  #     - hyperion_network
+
+  # signaling3:
+  #   build: ./server
+  #   environment:
+  #     NODE_ENV: development
+  #     INSTANCE_ID: 3
+  #   depends_on:
+  #     - kafka1
+  #   command: sh -c "./wait-for-it.sh kafka1:9094 -- node index.js"
+  #   networks:
+  #     - hyperion_network
+
+  redis:
+    image: redis:6.2-alpine
+    container_name: redis-secure
+    ports:
+    - "6379:6379"
+    volumes:
+    - redis-data:/data
+    networks:
+      - hyperion_network
+
+  nginx:
+    image: nginx:latest
+    ports:
+      - "3000:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - signaling1
+      # - signaling2
+      # - signaling3
+    networks:
+      - hyperion_network
+
+volumes:
+    redis-data:
+networks:
+  hyperion_network:
+    driver: bridge

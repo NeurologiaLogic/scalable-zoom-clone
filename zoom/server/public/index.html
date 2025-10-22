@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Hyperion SFU</title>
+<style>
+body {
+  font-family: sans-serif;
+  background: #111;
+  color: #fff;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  margin: 0;
+  padding: 0;
+}
+h1 { margin: 20px; }
+.controls {
+  margin: 10px;
+}
+input { margin: 0 5px; padding: 5px; border-radius: 4px; border: none; }
+button { padding: 5px 10px; margin: 0 5px; border-radius: 4px; border: none; cursor: pointer; background:#38bdf8; color:#000; font-weight:bold; }
+#videos {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: 10px;
+  width: 90%;
+  max-width: 1200px;
+  margin-top: 20px;
+}
+.video-container {
+  position: relative;
+}
+video {
+  width: 100%;
+  border: 2px solid #38bdf8;
+  border-radius: 8px;
+}
+.name-label {
+  position: absolute;
+  bottom: 5px;
+  left: 0;
+  right: 0;
+  text-align: center;
+  font-size: 14px;
+  font-weight: bold;
+  color: #fff;
+  background: rgba(0,0,0,0.5);
+  padding: 2px 0;
+  border-radius: 0 0 8px 8px;
+}
+.active-speaker {
+  border-color: #facc15 !important;
+  box-shadow: 0 0 15px #facc15;
+}
+</style>
+</head>
+<body>
+<h1>Hyperion SFU POC</h1>
+
+<div class="controls">
+  <input id="room" placeholder="Room ID" value="testroom">
+  <input id="name" placeholder="Name" value="user">
+  <button id="join">Join Room</button>
+  <button id="leave">Leave Room</button>
+</div>
+<div id="videos">
+  <div class="video-container" id="local-container">
+    <video id="local" autoplay muted></video>
+    <div class="name-label" id="local-label">Me</div>
+  </div>
+</div>
+<script src="./client.js" type="module"></script>
+</body>
+</html>
