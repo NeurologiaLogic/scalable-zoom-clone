@@ -4,7 +4,7 @@
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "frontend":"npx vite build"
+    "frontend": "npx vite build"
   },
   "dependencies": {
     "express": "^4.18.2",
@@ -12,6 +12,7 @@
     "kafkajs": "^2.2.4",
     "mediasoup": "^3.19.4",
     "mediasoup-client": "^3.17.0",
+    "redlock": "^5.0.0-beta.2",
     "socket.io": "^4.7.2",
     "socket.io-client": "^4.8.1"
   },

@@ -11,6 +11,7 @@ This repository contains a minimal scaffold for **Project Hyperion** using **med
 
 1. Build and run the backend:
 ```bash
+add '127.0.0.1 zoom.app' to 'C:\Windows\System32\drivers\etc\hosts' -> for ssl
 docker compose up --build
 ```
 
@@ -30,3 +31,6 @@ If you want, I can now:
 - Implement the mediasoup router/transport creation flows in `server/index.js` (note: mediasoup native build required),
 - Add client-side SDP/transport exchange in the UI,
 - Or generate a zip of this scaffold so you can download it. -->
+
+References:
+- https://www.youtube.com/watch?v=_z1cjyAxcnc&t=850s

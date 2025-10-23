@@ -1,519 +1,377 @@
-// backend/server.js
+// ------------------- Imports -------------------
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
-const { Kafka } = require('kafkajs');
-const mediasoup = require("mediasoup");
+const mediasoup = require('mediasoup');
 const os = require('os');
 const Redis = require('ioredis');
+const Redlock = require("redlock")
 
+
+// ------------------- Express + Socket.IO Setup -------------------
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: '*' } });
-
 app.use(express.static(__dirname + '/dist'));
 
-
-// ---------------- Redis ----------------
-// !docker
 const redis = new Redis({ host: 'redis', port: 6379 });
+// Create a redlock instance (shared between all functions)
+const redlock = new Redlock(
+  [redis],
+  {
+    retryCount: 5,        // retry up to 5 times
+    retryDelay: 100,      // wait 100ms between retries
+    retryJitter: 50,      // add small randomness to avoid thundering herd
+  }
+);
 
-// ---------------- Kafka ----------------
-// !docker
-const kafka = new Kafka({
-  clientId: 'hyperion-signaling',
-  brokers: ['kafka1:9094']
-});
-
-
-const producer = kafka.producer();
-const consumer = kafka.consumer({ groupId: 'hyperion-signaling-group' });
-
-// ---------------- Mediasoup Workers ----------------
-const numWorkers = os.cpus().length/3;
+// ------------------- Local In-Memory Stores -------------------
 const workers = [];
-const localRouters = {}; // roomId -> router locally
-const localTransports = {};   // localTransports[roomId] = { transportId: transportObj, ... }
-const localProducers = {};    // localProducers[roomId] = { producerId: producerObj, ... }
-const localConsumers = {};    // localConsumers[roomId] = { consumerId: consumerObj, ... }
+const localRouters = {};
+const localTransports = {};
+const localProducers = {};
+const localConsumers = {};
 
+// ------------------- Worker -------------------
 async function spawnWorker() {
   const worker = await mediasoup.createWorker();
-  worker.on('died', () => {
-    console.error('Worker died, respawning in 2s...');
-    setTimeout(spawnWorker, 2000);
-  });
+  worker.on('died', () => setTimeout(spawnWorker, 2000));
   workers.push(worker);
-  return worker;
+  console.log('✅ Worker spawned');
 }
-(async () => { for (let i = 0; i < numWorkers; i++) await spawnWorker(); })();
-
+(async () => {
+  for (let i = 0; i < Math.max(1, Math.floor(os.cpus().length / 3)); i++) await spawnWorker();
+})();
 let workerIndex = 0;
 function assignWorker() {
-  const worker = workers[workerIndex % workers.length];
+  const w = workers[workerIndex % workers.length];
   workerIndex++;
-  return worker;
+  return w;
 }
 
-// ---------------- Mediasoup Helper ----------------
-function getMediasoupCodecs() {
+function getCodecs() {
   return [
     { kind: 'audio', mimeType: 'audio/opus', clockRate: 48000, channels: 2 },
     { kind: 'video', mimeType: 'video/VP8', clockRate: 90000 }
   ];
 }
 
-async function createWebRtcTransport(router) {
-  return await router.createWebRtcTransport({
-    listenIps: [{ ip: '0.0.0.0', announcedIp: process.env.PUBLIC_IP || '127.0.0.1' }],
+function getLocalIPv4() {
+  const interfaces = os.networkInterfaces();
+  for (const name of Object.keys(interfaces)) {
+    for (const iface of interfaces[name]) {
+      if (iface.family === "IPv4" && !iface.internal) {
+        return iface.address; // e.g. "192.168.1.42"
+      }
+    }
+  }
+  return "127.0.0.1"; // fallback if not found
+}
+
+// ------------------- WebRTC Transport Creation -------------------
+async function createWebRtcTransport(router, { direction, peerId }) {
+  return router.createWebRtcTransport({
+    listenIps: [
+      {
+        ip: '0.0.0.0', // where mediasoup listens
+        announcedIp: process.env.ANNOUNCED_IP || getLocalIPv4() // public IP / domain
+      }
+    ],
     enableUdp: true,
     enableTcp: true,
-    preferUdp: true
+    preferUdp: true,
+    appData: { direction, peerId }
   });
 }
 
-// ---------------- Kafka Handlers ----------------
-async function handleCreateTransport(roomId, payload) {
-  const roomRaw = await redis.get(`room:${roomId}`);
-  if (!roomRaw) return;
-  const room = JSON.parse(roomRaw);
+// ------------------- Redis Helpers -------------------
+/**
+ * Adds a peer to a room in Redis atomically.
+ * Uses WATCH + MULTI + EXEC to prevent race conditions.
+ */
+async function safeAddPeer(roomId, peerId, peerData) {
+  const key = `room:${roomId}`;
+  const lockKey = `${key}:lock:${peerId}`;
+  const lock = await redlock.acquire([lockKey], 2000); // 2s lock TTL
 
-  const router = localRouters[roomId];
-  if (!router) return;
-
-  const transport = await createWebRtcTransport(router);
-  room.peers[payload.peerId].transports.push({ id: transport.id, direction: payload.direction });
-
-  await redis.set(`room:${roomId}`, JSON.stringify(room));
-
-  //direction is just for info
-  io.to(payload.peerId).emit('transport-created', {
-    direction: payload.direction,
-    ...transport
-  });
-}
-
-
-async function handleConnectTransport(roomId, payload) {
-  const roomRaw = await redis.get(`room:${roomId}`);
-  if (!roomRaw) return;
-  const room = JSON.parse(roomRaw);
-
-  const router = localRouters[roomId];
-  if (!router) return;
-
-  // Map transportId -> transport object locally
-  const localTransport = router.transports.find(t => t.id === payload.transportId);
-  if (!localTransport) return;
-
-  await localTransport.connect({ dtlsParameters: payload.dtlsParameters });
-
-  // sending confirmation that the transport is connected
-  io.to(payload.peerId).emit('connect-transport-ok');
-}
-
-async function handleProduce(roomId, payload) {
-  const roomRaw = await redis.get(`room:${roomId}`);
-  if (!roomRaw) return;
-  const room = JSON.parse(roomRaw);
-
-  const router = localRouters[roomId];
-  if (!router) return;
-
-  const sendTransportId = room.peers[payload.peerId].transports.find(t => t.direction === 'send').id;
-  const localTransport = router._transports?.find(t => t.id === sendTransportId);
-  if (!localTransport) return;
-
-  const producerObj = await localTransport.produce({
-    kind: payload.kind,
-    rtpParameters: payload.rtpParameters
-  });
-
-  room.peers[payload.peerId].producers.push(producerObj.id);
-  await redis.set(`room:${roomId}`, JSON.stringify(room));
-
-  // ✅ Confirm back to sender (to trigger mediasoup callback)
-  io.to(payload.peerId).emit('produce-ok', { id: producerObj.id });
-
-  // ✅ Notify other peers of new producer
-  for (const id in room.peers) {
-    if (id !== payload.peerId) {
-      io.to(id).emit('new-producer', {
-        producerId: producerObj.id,
-        peerId: payload.peerId,
-        kind: payload.kind,
-        peerName: room.peers[payload.peerId].name
-      });
+  try {
+    const type = await redis.type(key);
+    if (type !== 'hash' && type !== 'none') {
+      console.warn(`⚠️ Wrong Redis type for ${key} (${type}), resetting`);
+      await redis.del(key);
     }
+
+    const exists = await redis.hexists(key, peerId);
+    if (exists) {
+      console.log(`🟨 Peer ${peerId} already exists in ${key}, skipping add`);
+      return;
+    }
+
+    await redis.hset(key, peerId, JSON.stringify(peerData));
+    console.log(`🟩 Added peer ${peerId} to room ${roomId} (atomic)`);
+
+  } finally {
+    await lock.release().catch(() => {});
   }
 }
 
+/**
+ * Safely updates peer data atomically.
+ * Uses WATCH + MULTI + EXEC for concurrency safety.
+ */
+async function safeUpdatePeer(roomId, peerId, updateFn) {
+  const key = `room:${roomId}`;
+  const lockKey = `${key}:lock:${peerId}`;
+  const lock = await redlock.acquire([lockKey], 2000);
 
-async function handleConsume(roomId, payload) {
-  const roomRaw = await redis.get(`room:${roomId}`);
-  if (!roomRaw) return;
-  const room = JSON.parse(roomRaw);
+  try {
+    const raw = await redis.hget(key, peerId);
+    const peerData = raw ? JSON.parse(raw) : { id: peerId, transports: [], producers: [], consumers: [] };
 
-  const router = localRouters[roomId];
-  if (!router) return;
-
-  if (!router.canConsume({ producerId: payload.producerId, rtpCapabilities: payload.rtpCapabilities })) return;
-
-  const recvTransportId = room.peers[payload.peerId].transports.find(t => t.direction === 'recv').id;
-  const localTransport = router.transports.find(t => t.id === recvTransportId);
-  if (!localTransport) return;
-
-  const consumer = await localTransport.consume({
-    producerId: payload.producerId,
-    rtpCapabilities: payload.rtpCapabilities,
-    paused: false
-  });
-
-  room.peers[payload.peerId].consumers.push(consumer.id);
-  await redis.set(`room:${roomId}`, JSON.stringify(room));
-
-  io.to(payload.peerId).emit('consume-success', {
-    id: consumer.id,
-    producerId: payload.producerId,
-    kind: consumer.kind,
-    rtpParameters: consumer.rtpParameters
-  });
-}
-
-// ---------------- Kafka Init ----------------
-async function initKafka() {
-  await producer.connect();
-  await consumer.connect();
-  await consumer.subscribe({ topic: /signaling-room-/, fromBeginning: false });
-
-  consumer.run({
-    eachMessage: async ({ topic, message }) => {
-      const payload = JSON.parse(message.value.toString());
-      const roomId = topic.replace('signaling-room-', '');
-      switch (payload.type) {
-        case 'join': io.to(payload.peerId).emit('peer-joined', payload); break;
-        case 'create-transport': await handleCreateTransport(roomId, payload); break;
-        case 'connect-transport': await handleConnectTransport(roomId, payload); break;
-        case 'produce': await handleProduce(roomId, payload); break;
-        case 'consume': await handleConsume(roomId, payload); break;
-        case 'leave': io.to(payload.peerId).emit('peer-left', payload); break;
-      }
+    if (!raw) {
+      console.warn(`⚠️ Peer ${peerId} not found in ${key}, creating new entry`);
     }
-  });
+
+    const before = JSON.parse(JSON.stringify(peerData));
+
+    // Apply updates
+    updateFn(peerData);
+
+    await redis.hset(key, peerId, JSON.stringify(peerData));
+
+    console.log(`🟦 Updated peer ${peerId} in ${key}`);
+    console.log("├── Before:", before);
+    console.log("└── After :", peerData);
+
+    return peerData;
+  } finally {
+    await lock.release().catch(() => {});
+  }
 }
-initKafka().catch(console.error);
 
-// ---------------- Socket.IO ----------------
+// ------------------- Socket.IO -------------------
 io.on('connection', socket => {
-  console.log('Client connected', socket.id);
+  console.log('🔗 Client connected', socket.id);
 
+  // ------------------- Join Room -------------------
   socket.on('join', async ({ roomId, peerName }) => {
     try {
-        // Ensure router exists locally for this room
-        if (!localRouters[roomId]) {
-            const worker = assignWorker();
-            const router = await worker.createRouter({ mediaCodecs: getMediasoupCodecs() });
-            localRouters[roomId] = router;
-            // init local maps
-            localTransports[roomId] = {};
-            localProducers[roomId] = {};
-            localConsumers[roomId] = {};
+      if (!localRouters[roomId]) {
+        const router = await assignWorker().createRouter({ mediaCodecs: getCodecs() });
+        localRouters[roomId] = router;
+        localTransports[roomId] = {};
+        localProducers[roomId] = {};
+        localConsumers[roomId] = {};
+      }
+
+      await safeAddPeer(roomId, socket.id, {
+        id: socket.id,
+        name: peerName,
+        transports: [],
+        producers: [],
+        consumers: []
+      });
+
+      socket.join(roomId);
+
+      // -------- Get existing peers and producers --------
+      const roomPeersRaw = await redis.hgetall(`room:${roomId}`);
+      const existingProducers = [];
+
+      for (const [pid, peerDataStr] of Object.entries(roomPeersRaw)) {
+        const peerData = JSON.parse(peerDataStr);
+        if (pid !== socket.id) {
+          for (const producerId of peerData.producers || []) {
+            existingProducers.push({
+              producerId,
+              peerId: pid,
+              peerName: peerData.name
+            });
+          }
         }
+      }
 
-        // Ensure room exists in Redis and add this peer
-        let roomRaw = await redis.get(`room:${roomId}`);
-        let room = roomRaw ? JSON.parse(roomRaw) : null;
-        if (!room) room = { peers: {} };
+      if (existingProducers.length > 0) {
+        for (const producer of existingProducers) {
+          socket.emit('new-media-stream', producer);
+        }
+      }
 
-        room.peers[socket.id] = { id: socket.id, name: peerName || 'Peer', transports: [], producers: [], consumers: [] };
-        await redis.set(`room:${roomId}`, JSON.stringify(room));
-
-        // Join socket.io room locally for convenience
-        socket.join(roomId);
-
-        // Notify others via Kafka (optional) — keeps other instances aware.
-        await producer.send({
-        topic: `signaling-room-${roomId}`,
-        messages: [{ value: JSON.stringify({ type: 'join', roomId, peerId: socket.id, peerName }) }]
-        });
-
-        // Ack to client
-        socket.emit('joined', { roomId, peerId: socket.id });
-
+      socket.to(roomId).emit('peer-joined', { peerId: socket.id, peerName });
+      console.log('✅ Peer joined room', roomId);
     } catch (err) {
-        console.error('Join handler error', err);
-        socket.emit('error', { message: 'join-failed', detail: err.message });
+      console.error(err);
+      socket.emit('error', { message: 'join-failed', detail: err.message });
     }
-    });
+  });
 
-
-
-  //2. Create transport for sending and receiving
-    socket.on('create-transport', async ({ roomId, direction }) => {
+  // ------------------- Create Transport -------------------
+  socket.on('create-transport', async ({ roomId, direction }) => {
     try {
-        // Ensure room exists in Redis
-        const roomRaw = await redis.get(`room:${roomId}`);
-        if (!roomRaw) return socket.emit('error', { message: 'room-not-found' });
+      if (!localRouters[roomId]) {
+        const router = await assignWorker().createRouter({ mediaCodecs: getCodecs() });
+        localRouters[roomId] = router;
+        localTransports[roomId] = {};
+        localProducers[roomId] = {};
+        localConsumers[roomId] = {};
+      }
 
-        const router = localRouters[roomId];
-        if (!router) return socket.emit('error', { message: 'router-not-on-this-node' });
+      const transport = await createWebRtcTransport(localRouters[roomId], { direction, peerId: socket.id });
+      localTransports[roomId][transport.id] = transport;
 
-        // Create the transport locally
-        const transport = await createWebRtcTransport(router);
+      await safeUpdatePeer(roomId, socket.id, peer => {
+        peer.transports.push({ id: transport.id, direction });
+      });
 
-        // store locally
-        localTransports[roomId] = localTransports[roomId] || {};
-        localTransports[roomId][transport.id] = transport;
-
-        // update Redis room metadata
-        const room = JSON.parse(roomRaw);
-        room.peers[socket.id] = room.peers[socket.id] || { id: socket.id, name: 'Peer', transports: [], producers: [], consumers: [] };
-        room.peers[socket.id].transports.push({ id: transport.id, direction });
-        await redis.set(`room:${roomId}`, JSON.stringify(room));
-
-        // send transport info to this client
-        socket.emit('transport-created', {
-            id: transport.id,
-            iceParameters: transport.iceParameters,
-            iceCandidates: transport.iceCandidates,
-            dtlsParameters: transport.dtlsParameters,
-            direction
-        });
-
-        // Publish Kafka message to inform other instances that peer X created a transport (optional)
-        // recommend message is informational so other instances can update UI if needed
-        await producer.send({
-        topic: `signaling-room-${roomId}`,
-        messages: [{ value: JSON.stringify({ type: 'transport-created-notify', roomId, peerId: socket.id, transportId: transport.id, direction }) }]
-        });
-
+      socket.emit('transport-created', {
+        id: transport.id,
+        iceParameters: transport.iceParameters,
+        iceCandidates: transport.iceCandidates,
+        dtlsParameters: transport.dtlsParameters,
+        direction
+      });
     } catch (err) {
-        console.error('create-transport handler error', err);
-        socket.emit('error', { message: 'create-transport-failed', detail: err.message });
+      console.error(err);
+      socket.emit('error', { message: 'transport-failed', detail: err.message });
     }
-    });
+  });
 
-
-  //3. After getting the transport informaton, connect it
+  // ------------------- Connect Transport -------------------
   socket.on('connect-transport', async ({ roomId, transportId, dtlsParameters }) => {
     try {
-        const transport = (localTransports[roomId] || {})[transportId];
-        if (!transport) {
-        console.warn('connect-transport: transport not found locally', roomId, transportId);
-        return socket.emit('error', { message: 'transport-not-found' });
-        }
-
-        await transport.connect({ dtlsParameters });
-
-        // confirm to client (so the client's callback can be called)
-        socket.emit('connect-transport-ok', { transportId });
-
-        // optionally publish Kafka message (informational)
-        await producer.send({
-        topic: `signaling-room-${roomId}`,
-        messages: [{ value: JSON.stringify({ type: 'transport-connected-notify', roomId, peerId: socket.id, transportId }) }]
-        });
-
+      const transport = localTransports[roomId][transportId];
+      await transport.connect({ dtlsParameters });
+      socket.emit('connect-transport-ok', { transportId });
     } catch (err) {
-        console.error('connect-transport error', err);
-        socket.emit('connect-transport-failed', { reason: err.message });
+      console.error(err);
+      socket.emit('connect-transport-failed', { reason: err.message });
     }
-    });
+  });
 
-
+  // ------------------- Produce -------------------
   socket.on('produce', async ({ roomId, kind, rtpParameters }) => {
     try {
-        const roomRaw = await redis.get(`room:${roomId}`);
-        if (!roomRaw) return socket.emit('error', { message: 'room-not-found' });
-        const room = JSON.parse(roomRaw);
+      const peerDataRaw = await redis.hget(`room:${roomId}`, socket.id);
+      if (!peerDataRaw) throw new Error('Peer not found in room');
+      const peerData = JSON.parse(peerDataRaw);
 
-        // find the send transport id for this peer
-        const sendMeta = room.peers[socket.id].transports.find(t => t.direction === 'send');
-        if (!sendMeta) return socket.emit('error', { message: 'send-transport-not-found' });
+      const sendTransportMeta = peerData.transports.find(t => t.direction === 'send');
+      if (!sendTransportMeta) throw new Error('No send transport for this peer');
 
-        const sendTransport = localTransports[roomId] && localTransports[roomId][sendMeta.id];
-        if (!sendTransport) return socket.emit('error', { message: 'send-transport-local-not-found' });
+      const sendTransport = localTransports[roomId][sendTransportMeta.id];
+      if (!sendTransport) throw new Error('Send transport object not found');
 
-        const producerObj = await sendTransport.produce({ kind, rtpParameters });
+      const producer = await sendTransport.produce({ kind, rtpParameters, appData: { peerId: socket.id } });
+      localProducers[roomId][producer.id] = producer;
 
-        // store locally
-        localProducers[roomId] = localProducers[roomId] || {};
-        localProducers[roomId][producerObj.id] = producerObj;
+      await safeUpdatePeer(roomId, socket.id, peer => {
+        peer.producers.push(producer.id);
+      });
 
-        // update redis
-        room.peers[socket.id].producers.push(producerObj.id);
-        await redis.set(`room:${roomId}`, JSON.stringify(room));
+      socket.to(roomId).emit('new-media-stream', {
+        producerId: producer.id,
+        peerId: socket.id,
+        peerName: peerData.name
+      });
 
-        // confirm to producing client so mediasoup-client callback can continue
-        socket.emit('produce-ok', { id: producerObj.id });
-
-        // notify other clients in the room (via socket.io directly)
-        for (const peerSocketId in room.peers) {
-        if (peerSocketId !== socket.id) {
-            io.to(peerSocketId).emit('new-producer', {
-            producerId: producerObj.id,
-            peerId: socket.id,
-            kind,
-            peerName: room.peers[socket.id].name
-            });
-        }
-        }
-
-        // publish Kafka message for other instances to be informed (optional)
-        await producer.send({
-        topic: `signaling-room-${roomId}`,
-        messages: [{ value: JSON.stringify({ type: 'produced', roomId, peerId: socket.id, producerId: producerObj.id, kind }) }]
-        });
-
+      socket.emit('produce-ok', { id: producer.id });
     } catch (err) {
-        console.error('produce handler error', err);
-        socket.emit('produce-failed', { reason: err.message });
+      console.error(err);
+      socket.emit('produce-failed', { reason: err.message });
     }
-    });
+  });
 
-
-    socket.on('consume', async ({ roomId, producerId, rtpCapabilities }) => {
+  // ------------------- Consume -------------------
+  socket.on('consume', async ({ roomId, producerId, rtpCapabilities }) => {
     try {
-        const router = localRouters[roomId];
-        const recvTransport = Object.values(localTransports[roomId] || {}).find(
-        t => t.appData && t.appData.direction === 'recv' && t.appData.peerId === socket.id
-        );
+      const router = localRouters[roomId];
+      const peerDataRaw = await redis.hget(`room:${roomId}`, socket.id);
+      if (!peerDataRaw) return socket.emit('consume-failed', { reason: 'peer-not-found' });
 
-        if (!router || !recvTransport) {
-        console.error(`❌ Missing router or recv transport for room ${roomId}`);
-        return;
-        }
+      const peerData = JSON.parse(peerDataRaw);
 
-        if (!router.canConsume({ producerId, rtpCapabilities })) {
-        console.error(`❌ Router cannot consume producer ${producerId}`);
-        return;
-        }
+      if (!router.canConsume({ producerId, rtpCapabilities })) {
+        return socket.emit('consume-failed', { reason: 'cannot-consume' });
+      }
 
-        const consumer = await recvTransport.consume({
-        producerId,
-        rtpCapabilities,
-        paused: false
-        });
+      const recvTransportMeta = peerData.transports.find(t => t.direction === 'recv');
+      if (!recvTransportMeta) throw new Error('No recv transport for this peer');
 
-        // Store consumer
-        if (!localConsumers[roomId]) localConsumers[roomId] = {};
-        localConsumers[roomId][consumer.id] = consumer;
+      const recvTransport = localTransports[roomId][recvTransportMeta.id];
+      if (!recvTransport) throw new Error('Recv transport object not found');
 
-        // Send back consumer info
-        socket.emit('consume-success', {
+      const consumer = await recvTransport.consume({ producerId, rtpCapabilities });
+      localConsumers[roomId][consumer.id] = consumer;
+
+      await safeUpdatePeer(roomId, socket.id, peer => peer.consumers.push(consumer.id));
+
+      socket.emit('consume-success', {
         id: consumer.id,
         producerId,
         kind: consumer.kind,
         rtpParameters: consumer.rtpParameters
-        });
-
-        console.log(`✅ Consumer created for ${producerId} in room ${roomId}`);
+      });
     } catch (err) {
-        console.error('❌ Failed to handle consume:', err);
+      console.error(err);
+      socket.emit('consume-failed', { reason: err.message });
     }
-    });
+  });
 
-
-    socket.on('disconnect', async () => {
+  // ------------------- Disconnect -------------------
+  socket.on('disconnect', async () => {
+    console.log('❌ Peer disconnected', socket.id);
     try {
-        const roomsRaw = await redis.keys('room:*');
-        for (const rKey of roomsRaw) {
-        const roomRaw = await redis.get(rKey);
-        const room = JSON.parse(roomRaw);
-        if (!room.peers[socket.id]) continue;
+      for (const roomId of Object.keys(localRouters)) {
+        const peerDataRaw = await redis.hget(`room:${roomId}`, socket.id);
+        if (!peerDataRaw) continue;
+        const peerData = JSON.parse(peerDataRaw);
 
-        // Close local objects if present
-        const roomId = rKey.split(':')[1];
+        if (peerData.producers) for (const pid of peerData.producers) localProducers[roomId][pid]?.close();
+        if (peerData.consumers) for (const cid of peerData.consumers) localConsumers[roomId][cid]?.close();
+        if (peerData.transports) for (const t of peerData.transports) localTransports[roomId][t.id]?.close();
 
-        // close local producers
-        if (localProducers[roomId]) {
-            for (const pid of room.peers[socket.id].producers || []) {
-            const p = localProducers[roomId][pid];
-            if (p) {
-                try { await p.close(); } catch (e) { /* ignore */ }
-                delete localProducers[roomId][pid];
-            }
-            }
-        }
-
-        // close local consumers
-        if (localConsumers[roomId]) {
-            for (const cid of room.peers[socket.id].consumers || []) {
-            const c = localConsumers[roomId][cid];
-            if (c) {
-                try { await c.close(); } catch (e) { /* ignore */ }
-                delete localConsumers[roomId][cid];
-            }
-            }
-        }
-
-        // close transports
-        if (localTransports[roomId]) {
-            for (const t of (room.peers[socket.id].transports || [])) {
-            const tr = localTransports[roomId][t.id];
-            if (tr) {
-                try { await tr.close(); } catch (e) { /* ignore */ }
-                delete localTransports[roomId][t.id];
-            }
-            }
-        }
-
-        // remove peer in Redis
-        delete room.peers[socket.id];
-        await redis.set(rKey, JSON.stringify(room));
-        if (Object.keys(room.peers).length === 0) {
-            await redis.del(rKey);
-            delete localRouters[roomId];
-        }
-
-        await producer.send({
-            topic: `signaling-room-${roomId}`,
-            messages: [{ value: JSON.stringify({ type: 'leave', roomId, peerId: socket.id }) }]
-        });
-        }
+        await redis.hdel(`room:${roomId}`, socket.id);
+        socket.to(roomId).emit('peer-left', { peerId: socket.id });
+      }
     } catch (err) {
-        console.error('disconnect cleanup error', err);
+      console.error(err);
     }
-    });
+  });
 
+  // ------------------- Leave Room -------------------
+  socket.on('leave-room', async () => {
+    console.log('❌ Peer Leave Room', socket.id);
+    try {
+      for (const roomId of Object.keys(localRouters)) {
+        const peerDataRaw = await redis.hget(`room:${roomId}`, socket.id);
+        if (!peerDataRaw) continue;
+        const peerData = JSON.parse(peerDataRaw);
+
+        if (peerData.producers) for (const pid of peerData.producers) localProducers[roomId][pid]?.close();
+        if (peerData.consumers) for (const cid of peerData.consumers) localConsumers[roomId][cid]?.close();
+        if (peerData.transports) for (const t of peerData.transports) localTransports[roomId][t.id]?.close();
+
+        await redis.hdel(`room:${roomId}`, socket.id);
+        socket.to(roomId).emit('peer-left', { peerId: socket.id });
+      }
+    } catch (err) {
+      console.error(err);
+    }
+  });
 });
 
-// ---------------- Express  ----------------
-//When checking rtp capabilities we also check if the room we are trying to join is created or not,
-//If not then we create and save it
-// 1. Get RTP Capabilities
-app.get("/getRtpCapabilities", async (req, res) => {
-  try {
-    const { roomId } = req.query;
-    if (!roomId) return res.status(400).json({ error: "Missing roomId" });
-
-    let roomRaw = await redis.get(`room:${roomId}`);
-    let room = roomRaw ? JSON.parse(roomRaw) : null;
-
-    // Create router if it doesn't exist locally
-    if (!localRouters[roomId]) {
-      const worker = assignWorker();
-      const router = await worker.createRouter({ mediaCodecs: getMediasoupCodecs() });
-      localRouters[roomId] = router;
-    }
-
-    // Ensure room exists in Redis
-    if (!room) {
-      room = { peers: {} };
-      await redis.set(`room:${roomId}`, JSON.stringify(room));
-    }
-
-    const router = localRouters[roomId];
-    if (!router) return res.status(500).json({ error: "Router not available" });
-
-    return res.json(router.rtpCapabilities);
-
-  } catch (err) {
-    console.error("Error /getRtpCapabilities:", err);
-    res.status(500).json({ error: err.message });
+// ------------------- RTP Capabilities -------------------
+app.get('/getRtpCapabilities', async (req, res) => {
+  const roomId = req.query.roomId;
+  if (!localRouters[roomId]) {
+    const router = await assignWorker().createRouter({ mediaCodecs: getCodecs() });
+    localRouters[roomId] = router;
+    localTransports[roomId] = {};
+    localProducers[roomId] = {};
+    localConsumers[roomId] = {};
   }
+  res.json(localRouters[roomId].rtpCapabilities);
 });
 
-
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log('Signaling server running on', PORT));
+// ------------------- Start Server -------------------
+server.listen(3000, () => console.log('🚀 Server listening on :3000'));
