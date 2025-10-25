@@ -1,47 +1,62 @@
-// ------------------- Imports -------------------
+// server.js
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const mediasoup = require('mediasoup');
 const os = require('os');
 const Redis = require('ioredis');
-const Redlock = require("redlock")
+const { default: Redlock } = require('redlock');
 
+console.log('[BACKEND] starting server.js');
 
-// ------------------- Express + Socket.IO Setup -------------------
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: '*' } });
 app.use(express.static(__dirname + '/dist'));
 
+// Redis + redlock (same as your code)
 const redis = new Redis({ host: 'redis', port: 6379 });
-// Create a redlock instance (shared between all functions)
-const redlock = new Redlock(
-  [redis],
-  {
-    retryCount: 5,        // retry up to 5 times
-    retryDelay: 100,      // wait 100ms between retries
-    retryJitter: 50,      // add small randomness to avoid thundering herd
-  }
-);
+let redlock;
+const commonOptions = { retryCount: 5, retryDelay: 100, retryJitter: 50 };
 
-// ------------------- Local In-Memory Stores -------------------
+try {
+  redlock = new Redlock([redis], commonOptions);
+} catch (e1) {
+  try {
+    redlock = new Redlock({ clients: [redis], ...commonOptions });
+  } catch (e2) {
+    console.error('[BACKEND] redlock construction failed', e1, e2);
+    throw e2;
+  }
+}
+
+// in-memory maps (per room)
 const workers = [];
 const localRouters = {};
 const localTransports = {};
 const localProducers = {};
 const localConsumers = {};
 
-// ------------------- Worker -------------------
-async function spawnWorker() {
-  const worker = await mediasoup.createWorker();
-  worker.on('died', () => setTimeout(spawnWorker, 2000));
-  workers.push(worker);
-  console.log('✅ Worker spawned');
+function trace(tag, msg, data) {
+  console.log(`[BACKEND][${tag}] ${msg}`, data || "");
 }
+
+async function spawnWorker() {
+  trace('worker', 'creating mediasoup worker');
+  const worker = await mediasoup.createWorker();
+  worker.on('died', () => {
+    trace('worker', 'worker died, respawning in 2s');
+    setTimeout(() => spawnWorker().catch(e => console.error(e)), 2000);
+  });
+  workers.push(worker);
+  trace('worker', 'worker spawned');
+}
+
 (async () => {
-  for (let i = 0; i < Math.max(1, Math.floor(os.cpus().length / 3)); i++) await spawnWorker();
+  const num = Math.max(1, Math.floor(os.cpus().length / 3));
+  for (let i = 0; i < num; i++) await spawnWorker();
 })();
+
 let workerIndex = 0;
 function assignWorker() {
   const w = workers[workerIndex % workers.length];
@@ -57,104 +72,88 @@ function getCodecs() {
 }
 
 function getLocalIPv4() {
-  const interfaces = os.networkInterfaces();
-  for (const name of Object.keys(interfaces)) {
-    for (const iface of interfaces[name]) {
-      if (iface.family === "IPv4" && !iface.internal) {
-        return iface.address; // e.g. "192.168.1.42"
-      }
+  const ifs = os.networkInterfaces();
+  for (const name of Object.keys(ifs)) {
+    for (const iface of ifs[name]) {
+      if (iface.family === 'IPv4' && !iface.internal) return iface.address;
     }
   }
-  return "127.0.0.1"; // fallback if not found
+  return '127.0.0.1';
 }
 
-// ------------------- WebRTC Transport Creation -------------------
 async function createWebRtcTransport(router, { direction, peerId }) {
-  return router.createWebRtcTransport({
-    listenIps: [
-      {
-        ip: '0.0.0.0', // where mediasoup listens
-        announcedIp: process.env.ANNOUNCED_IP || getLocalIPv4() // public IP / domain
-      }
-    ],
+  trace('transport', `createWebRtcTransport direction=${direction} peerId=${peerId}`);
+  const transport = await router.createWebRtcTransport({
+    listenIps: [{ ip: '0.0.0.0', announcedIp: process.env.ANNOUNCED_IP || getLocalIPv4() }],
     enableUdp: true,
     enableTcp: true,
     preferUdp: true,
     appData: { direction, peerId }
   });
+  trace('transport', `created transport id=${transport.id}`);
+  return transport;
 }
 
-// ------------------- Redis Helpers -------------------
-/**
- * Adds a peer to a room in Redis atomically.
- * Uses WATCH + MULTI + EXEC to prevent race conditions.
- */
+// Redis helpers (same but with trace)
 async function safeAddPeer(roomId, peerId, peerData) {
   const key = `room:${roomId}`;
   const lockKey = `${key}:lock:${peerId}`;
-  const lock = await redlock.acquire([lockKey], 2000); // 2s lock TTL
-
+  trace('redis', `safeAddPeer acquiring lock ${lockKey}`);
+  const lock = await redlock.acquire([lockKey], 2000);
   try {
     const type = await redis.type(key);
     if (type !== 'hash' && type !== 'none') {
-      console.warn(`⚠️ Wrong Redis type for ${key} (${type}), resetting`);
+      trace('redis', `wrong redis type for ${key} (${type}), resetting`);
       await redis.del(key);
     }
-
     const exists = await redis.hexists(key, peerId);
     if (exists) {
-      console.log(`🟨 Peer ${peerId} already exists in ${key}, skipping add`);
+      trace('redis', `peer ${peerId} already exists in ${key}`);
       return;
     }
-
     await redis.hset(key, peerId, JSON.stringify(peerData));
-    console.log(`🟩 Added peer ${peerId} to room ${roomId} (atomic)`);
-
+    trace('redis', `added peer ${peerId} to ${key}`);
   } finally {
-    await lock.release().catch(() => {});
+    await lock.release().catch(() => trace('redis', 'lock release failed (ignored)'));
   }
 }
 
-/**
- * Safely updates peer data atomically.
- * Uses WATCH + MULTI + EXEC for concurrency safety.
- */
 async function safeUpdatePeer(roomId, peerId, updateFn) {
   const key = `room:${roomId}`;
   const lockKey = `${key}:lock:${peerId}`;
+  trace('redis', `safeUpdatePeer acquiring lock ${lockKey}`);
   const lock = await redlock.acquire([lockKey], 2000);
-
   try {
     const raw = await redis.hget(key, peerId);
     const peerData = raw ? JSON.parse(raw) : { id: peerId, transports: [], producers: [], consumers: [] };
-
-    if (!raw) {
-      console.warn(`⚠️ Peer ${peerId} not found in ${key}, creating new entry`);
-    }
-
     const before = JSON.parse(JSON.stringify(peerData));
-
-    // Apply updates
     updateFn(peerData);
-
     await redis.hset(key, peerId, JSON.stringify(peerData));
-
-    console.log(`🟦 Updated peer ${peerId} in ${key}`);
-    console.log("├── Before:", before);
-    console.log("└── After :", peerData);
-
+    trace('redis', `updated peer ${peerId} in ${key}`, { before, after: peerData });
     return peerData;
   } finally {
-    await lock.release().catch(() => {});
+    await lock.release().catch(() => trace('redis', 'lock release failed (ignored)'));
   }
 }
 
-// ------------------- Socket.IO -------------------
-io.on('connection', socket => {
-  console.log('🔗 Client connected', socket.id);
 
-  // ------------------- Join Room -------------------
+(async () => {
+  console.log("[BACKEND][init] 🧹 Clearing mediasoup state in Redis...");
+  const keys = await redis.keys("mediasoup:*"); // adjust your prefix
+  if (keys.length > 0) {
+    await redis.del(keys);
+    console.log(`[BACKEND][init] ✅ Cleared ${keys.length} mediasoup keys`);
+  } else {
+    console.log("[BACKEND][init] ✅ No mediasoup keys found to clear");
+  }
+})();
+
+// ------------------- Socket.IO -------------------
+io.on('connection', (socket) => {
+  trace('socket', 'client connected', socket.id);
+
   socket.on('join', async ({ roomId, peerName }) => {
+    trace('join', `join requested by ${socket.id} name=${peerName} room=${roomId}`);
     try {
       if (!localRouters[roomId]) {
         const router = await assignWorker().createRouter({ mediaCodecs: getCodecs() });
@@ -162,51 +161,20 @@ io.on('connection', socket => {
         localTransports[roomId] = {};
         localProducers[roomId] = {};
         localConsumers[roomId] = {};
+        trace('join', `router created for room ${roomId}`);
       }
-
-      await safeAddPeer(roomId, socket.id, {
-        id: socket.id,
-        name: peerName,
-        transports: [],
-        producers: [],
-        consumers: []
-      });
-
+      await safeAddPeer(roomId, socket.id, { id: socket.id, name: peerName, transports: [], producers: [], consumers: [] });
       socket.join(roomId);
-
-      // -------- Get existing peers and producers --------
-      const roomPeersRaw = await redis.hgetall(`room:${roomId}`);
-      const existingProducers = [];
-
-      for (const [pid, peerDataStr] of Object.entries(roomPeersRaw)) {
-        const peerData = JSON.parse(peerDataStr);
-        if (pid !== socket.id) {
-          for (const producerId of peerData.producers || []) {
-            existingProducers.push({
-              producerId,
-              peerId: pid,
-              peerName: peerData.name
-            });
-          }
-        }
-      }
-
-      if (existingProducers.length > 0) {
-        for (const producer of existingProducers) {
-          socket.emit('new-media-stream', producer);
-        }
-      }
-
       socket.to(roomId).emit('peer-joined', { peerId: socket.id, peerName });
-      console.log('✅ Peer joined room', roomId);
-    } catch (err) {
-      console.error(err);
-      socket.emit('error', { message: 'join-failed', detail: err.message });
+      trace('join', `peer ${socket.id} joined room ${roomId}`);
+    } catch (e) {
+      trace('join', 'join failed', e);
+      socket.emit('error', { message: 'join-failed', detail: e.message });
     }
   });
 
-  // ------------------- Create Transport -------------------
   socket.on('create-transport', async ({ roomId, direction }) => {
+    trace('transport', `create-transport request direction=${direction} from ${socket.id} room=${roomId}`);
     try {
       if (!localRouters[roomId]) {
         const router = await assignWorker().createRouter({ mediaCodecs: getCodecs() });
@@ -214,15 +182,13 @@ io.on('connection', socket => {
         localTransports[roomId] = {};
         localProducers[roomId] = {};
         localConsumers[roomId] = {};
+        trace('transport', 'router created while creating transport');
       }
-
       const transport = await createWebRtcTransport(localRouters[roomId], { direction, peerId: socket.id });
       localTransports[roomId][transport.id] = transport;
-
       await safeUpdatePeer(roomId, socket.id, peer => {
         peer.transports.push({ id: transport.id, direction });
       });
-
       socket.emit('transport-created', {
         id: transport.id,
         iceParameters: transport.iceParameters,
@@ -230,26 +196,29 @@ io.on('connection', socket => {
         dtlsParameters: transport.dtlsParameters,
         direction
       });
-    } catch (err) {
-      console.error(err);
-      socket.emit('error', { message: 'transport-failed', detail: err.message });
+      trace('transport', `transport-created emitted for ${direction} id=${transport.id}`);
+    } catch (e) {
+      trace('transport', 'create-transport failed', e);
+      socket.emit('error', { message: 'transport-failed', detail: e.message });
     }
   });
 
-  // ------------------- Connect Transport -------------------
   socket.on('connect-transport', async ({ roomId, transportId, dtlsParameters }) => {
+    trace('transport', `connect-transport called for transport=${transportId} room=${roomId} by ${socket.id}`);
     try {
       const transport = localTransports[roomId][transportId];
+      if (!transport) throw new Error('transport object not found');
       await transport.connect({ dtlsParameters });
       socket.emit('connect-transport-ok', { transportId });
-    } catch (err) {
-      console.error(err);
-      socket.emit('connect-transport-failed', { reason: err.message });
+      trace('transport', `transport connected ${transportId}`);
+    } catch (e) {
+      trace('transport', 'connect-transport failed', e);
+      socket.emit('connect-transport-failed', { reason: e.message });
     }
   });
 
-  // ------------------- Produce -------------------
-  socket.on('produce', async ({ roomId, kind, rtpParameters }) => {
+  socket.on('produce', async ({ roomId, kind, rtpParameters }, ack) => {
+    trace('produce', `produce() from ${socket.id} kind=${kind} room=${roomId}`);
     try {
       const peerDataRaw = await redis.hget(`room:${roomId}`, socket.id);
       if (!peerDataRaw) throw new Error('Peer not found in room');
@@ -261,117 +230,161 @@ io.on('connection', socket => {
       const sendTransport = localTransports[roomId][sendTransportMeta.id];
       if (!sendTransport) throw new Error('Send transport object not found');
 
-      const producer = await sendTransport.produce({ kind, rtpParameters, appData: { peerId: socket.id } });
+      const producer = await sendTransport.produce({
+        kind,
+        rtpParameters,
+        appData: { peerId: socket.id }
+      });
       localProducers[roomId][producer.id] = producer;
 
-      await safeUpdatePeer(roomId, socket.id, peer => {
-        peer.producers.push(producer.id);
-      });
+      await safeUpdatePeer(roomId, socket.id, peer => peer.producers.push(producer.id));
+      trace('produce', `producer created id=${producer.id}`);
 
-      socket.to(roomId).emit('new-media-stream', {
+      // notify other peers
+      socket.to(roomId).emit('new-producer', {
         producerId: producer.id,
         peerId: socket.id,
-        peerName: peerData.name
+        peerName: peerData.name || socket.id
       });
 
-      socket.emit('produce-ok', { id: producer.id });
-    } catch (err) {
-      console.error(err);
-      socket.emit('produce-failed', { reason: err.message });
+      // ✅ respond via acknowledgement
+      ack({ id: producer.id });
+    } catch (e) {
+      trace('produce', 'produce failed', e);
+      ack({ error: e.message });
     }
   });
 
-  // ------------------- Consume -------------------
-  socket.on('consume', async ({ roomId, producerId, rtpCapabilities }) => {
+
+  socket.on('consume', async ({ roomId, producerId, rtpCapabilities }, callback) => {
+    trace('consume', `consume() request from ${socket.id} for producer ${producerId} in room ${roomId}`);
     try {
       const router = localRouters[roomId];
-      const peerDataRaw = await redis.hget(`room:${roomId}`, socket.id);
-      if (!peerDataRaw) return socket.emit('consume-failed', { reason: 'peer-not-found' });
-
-      const peerData = JSON.parse(peerDataRaw);
-
-      if (!router.canConsume({ producerId, rtpCapabilities })) {
-        return socket.emit('consume-failed', { reason: 'cannot-consume' });
+      if (!router) {
+        trace('consume', 'router not found');
+        return callback({ params: null });
       }
 
+      if (!router.canConsume({ producerId, rtpCapabilities })) {
+        trace('consume', `router cannot consume producer ${producerId}`);
+        return callback({ params: null });
+      }
+
+      const peerDataRaw = await redis.hget(`room:${roomId}`, socket.id);
+      if (!peerDataRaw) {
+        trace('consume', `peer data not found for ${socket.id}`);
+        return callback({ params: null });
+      }
+      const peerData = JSON.parse(peerDataRaw);
+
       const recvTransportMeta = peerData.transports.find(t => t.direction === 'recv');
-      if (!recvTransportMeta) throw new Error('No recv transport for this peer');
+      if (!recvTransportMeta) {
+        trace('consume', 'no recv transport for peer');
+        return callback({ params: null });
+      }
 
       const recvTransport = localTransports[roomId][recvTransportMeta.id];
-      if (!recvTransport) throw new Error('Recv transport object not found');
+      if (!recvTransport) {
+        trace('consume', 'recvTransport object not found');
+        return callback({ params: null });
+      }
 
       const consumer = await recvTransport.consume({ producerId, rtpCapabilities });
       localConsumers[roomId][consumer.id] = consumer;
 
       await safeUpdatePeer(roomId, socket.id, peer => peer.consumers.push(consumer.id));
+      trace('consume', `consumer created id=${consumer.id} for producer ${producerId}`);
 
-      socket.emit('consume-success', {
-        id: consumer.id,
-        producerId,
-        kind: consumer.kind,
-        rtpParameters: consumer.rtpParameters
+      callback({
+        params: {
+          id: consumer.id,
+          producerId,
+          kind: consumer.kind,
+          rtpParameters: consumer.rtpParameters
+        }
       });
-    } catch (err) {
-      console.error(err);
-      socket.emit('consume-failed', { reason: err.message });
+    } catch (e) {
+      trace('consume', 'consume error', e);
+      callback({ params: null });
     }
   });
 
-  // ------------------- Disconnect -------------------
-  socket.on('disconnect', async () => {
-    console.log('❌ Peer disconnected', socket.id);
+  socket.on('request-existing-producers', async ({ roomId }) => {
+    trace('socket', `request-existing-producers received from ${socket.id} for room ${roomId}`);
     try {
-      for (const roomId of Object.keys(localRouters)) {
-        const peerDataRaw = await redis.hget(`room:${roomId}`, socket.id);
-        if (!peerDataRaw) continue;
-        const peerData = JSON.parse(peerDataRaw);
-
-        if (peerData.producers) for (const pid of peerData.producers) localProducers[roomId][pid]?.close();
-        if (peerData.consumers) for (const cid of peerData.consumers) localConsumers[roomId][cid]?.close();
-        if (peerData.transports) for (const t of peerData.transports) localTransports[roomId][t.id]?.close();
-
-        await redis.hdel(`room:${roomId}`, socket.id);
-        socket.to(roomId).emit('peer-left', { peerId: socket.id });
+      const roomPeersRaw = await redis.hgetall(`room:${roomId}`);
+      const existingProducers = [];
+      for (const [pid, peerDataStr] of Object.entries(roomPeersRaw)) {
+        const peerData = JSON.parse(peerDataStr);
+        if (pid !== socket.id) {
+          for (const producerId of peerData.producers || []) {
+            existingProducers.push({ producerId, peerId: pid, peerName: peerData.name });
+          }
+        }
       }
-    } catch (err) {
-      console.error(err);
+      trace('socket', 'existing producers compiled', existingProducers.map(p => p.producerId));
+      socket.emit('existing-producers', existingProducers);
+    } catch (e) {
+      trace('socket', 'request-existing-producers failed', e);
     }
   });
 
-  // ------------------- Leave Room -------------------
   socket.on('leave-room', async () => {
-    console.log('❌ Peer Leave Room', socket.id);
+    trace('leave', `leave-room called by ${socket.id}`);
     try {
       for (const roomId of Object.keys(localRouters)) {
         const peerDataRaw = await redis.hget(`room:${roomId}`, socket.id);
         if (!peerDataRaw) continue;
         const peerData = JSON.parse(peerDataRaw);
-
         if (peerData.producers) for (const pid of peerData.producers) localProducers[roomId][pid]?.close();
         if (peerData.consumers) for (const cid of peerData.consumers) localConsumers[roomId][cid]?.close();
         if (peerData.transports) for (const t of peerData.transports) localTransports[roomId][t.id]?.close();
-
         await redis.hdel(`room:${roomId}`, socket.id);
         socket.to(roomId).emit('peer-left', { peerId: socket.id });
+        trace('leave', `peer ${socket.id} removed from room ${roomId}`);
       }
-    } catch (err) {
-      console.error(err);
+    } catch (e) {
+      trace('leave', 'leave-room failed', e);
+    }
+  });
+
+  socket.on('disconnect', async () => {
+    trace('socket', `disconnect detected for ${socket.id}`);
+    try {
+      for (const roomId of Object.keys(localRouters)) {
+        const peerDataRaw = await redis.hget(`room:${roomId}`, socket.id);
+        if (!peerDataRaw) continue;
+        const peerData = JSON.parse(peerDataRaw);
+        if (peerData.producers) for (const pid of peerData.producers) localProducers[roomId][pid]?.close();
+        if (peerData.consumers) for (const cid of peerData.consumers) localConsumers[roomId][cid]?.close();
+        if (peerData.transports) for (const t of peerData.transports) localTransports[roomId][t.id]?.close();
+        await redis.hdel(`room:${roomId}`, socket.id);
+        socket.to(roomId).emit('peer-left', { peerId: socket.id });
+        trace('socket', `peer ${socket.id} cleaned up from room ${roomId}`);
+      }
+    } catch (e) {
+      trace('socket', 'disconnect cleanup failed', e);
     }
   });
 });
 
-// ------------------- RTP Capabilities -------------------
+// RTP capabilities endpoint
 app.get('/getRtpCapabilities', async (req, res) => {
-  const roomId = req.query.roomId;
-  if (!localRouters[roomId]) {
-    const router = await assignWorker().createRouter({ mediaCodecs: getCodecs() });
-    localRouters[roomId] = router;
-    localTransports[roomId] = {};
-    localProducers[roomId] = {};
-    localConsumers[roomId] = {};
+  try {
+    const roomId = req.query.roomId;
+    if (!localRouters[roomId]) {
+      const router = await assignWorker().createRouter({ mediaCodecs: getCodecs() });
+      localRouters[roomId] = router;
+      localTransports[roomId] = {};
+      localProducers[roomId] = {};
+      localConsumers[roomId] = {};
+      trace('http', `router created for room ${roomId} on /getRtpCapabilities`);
+    }
+    res.json(localRouters[roomId].rtpCapabilities);
+  } catch (e) {
+    trace('http', 'getRtpCapabilities failed', e);
+    res.status(500).json({ error: e.message });
   }
-  res.json(localRouters[roomId].rtpCapabilities);
 });
 
-// ------------------- Start Server -------------------
-server.listen(3000, () => console.log('🚀 Server listening on :3000'));
+server.listen(3000, () => trace('system', 'Server listening on :3000'));
