@@ -243,8 +243,8 @@ io.on('connection', (socket) => {
         rtpParameters,
         appData: { peerId: socket.id }
       });
+      console.log('Producer created', producer.id, producer.kind, producer.rtpParameters.codecs);
       localProducers[roomId][producer.id] = producer;
-
       await safeUpdatePeer(roomId, socket.id, peer => peer.producers.push(producer.id));
       trace('produce', `producer created id=${producer.id}`);
 
@@ -266,76 +266,94 @@ io.on('connection', (socket) => {
 
   socket.on('consume', async ({ roomId, producerId, rtpCapabilities }, callback) => {
     trace('consume', `consume() request from ${socket.id} for producer ${producerId} in room ${roomId}`);
+
     try {
       const router = localRouters[roomId];
-      if (!router) {
-        trace('consume', 'router not found');
-        return callback({ params: null });
-      }
+      if (!router) return callback({ error: 'no router', params: null });
 
       if (!router.canConsume({ producerId, rtpCapabilities })) {
         trace('consume', `router cannot consume producer ${producerId}`);
-        return callback({ params: null });
+        return callback({ error: 'cannot consume', params: null });
       }
 
       const peerDataRaw = await redis.hget(`room:${roomId}`, socket.id);
-      if (!peerDataRaw) {
-        trace('consume', `peer data not found for ${socket.id}`);
-        return callback({ params: null });
-      }
+      if (!peerDataRaw) return callback({ error: 'peer not found', params: null });
       const peerData = JSON.parse(peerDataRaw);
 
       const recvTransportMeta = peerData.transports.find(t => t.direction === 'recv');
-      if (!recvTransportMeta) {
-        trace('consume', 'no recv transport for peer');
-        return callback({ params: null });
-      }
+      if (!recvTransportMeta) return callback({ error: 'no recv transport', params: null });
 
-      const recvTransport = localTransports[roomId][recvTransportMeta.id];
-      if (!recvTransport) {
-        trace('consume', 'recvTransport object not found');
-        return callback({ params: null });
-      }
+      const recvTransport = localTransports[roomId]?.[recvTransportMeta.id];
+      if (!recvTransport) return callback({ error: 'recv transport not found', params: null });
 
-      const consumer = await recvTransport.consume({ producerId, rtpCapabilities });
+      const consumer = await recvTransport.consume({
+        producerId,
+        rtpCapabilities,
+        paused: true // <-- IMPORTANT: auto start playback
+      });
+
+      if (!localConsumers[roomId]) localConsumers[roomId] = {};
       localConsumers[roomId][consumer.id] = consumer;
 
       await safeUpdatePeer(roomId, socket.id, peer => peer.consumers.push(consumer.id));
       trace('consume', `consumer created id=${consumer.id} for producer ${producerId}`);
 
+      await consumer.resume();
+           
+      if (consumer.kind === 'video') {
+        try {
+          await consumer.requestKeyFrame(); // <-- THIS triggers the keyframe
+          trace('consume', `Keyframe requested for consumer ${consumer.id}`);
+        } catch (e) {
+          trace('consume', 'Keyframe request failed', e);
+        }
+      }
       callback({
         params: {
           id: consumer.id,
-          producerId,
+          producerId:consumer.producerId,
           kind: consumer.kind,
           rtpParameters: consumer.rtpParameters
         }
       });
     } catch (e) {
       trace('consume', 'consume error', e);
-      callback({ params: null });
+      callback({ error: e.message, params: null });
     }
   });
 
-  socket.on('request-existing-producers', async ({ roomId }) => {
+
+
+  socket.on('request-existing-producers', async ({ roomId }, callback) => {
     trace('socket', `request-existing-producers received from ${socket.id} for room ${roomId}`);
+
     try {
       const roomPeersRaw = await redis.hgetall(`room:${roomId}`);
       const existingProducers = [];
+
       for (const [pid, peerDataStr] of Object.entries(roomPeersRaw)) {
+        if (pid === socket.id) continue; // skip self
         const peerData = JSON.parse(peerDataStr);
-        if (pid !== socket.id) {
-          for (const producerId of peerData.producers || []) {
-            existingProducers.push({ producerId, peerId: pid, peerName: peerData.name });
-          }
+
+        for (const producerId of peerData.producers || []) {
+          existingProducers.push({
+            producerId,
+            peerId: pid,
+            peerName: peerData.name
+          });
         }
       }
+
       trace('socket', 'existing producers compiled', existingProducers.map(p => p.producerId));
-      socket.emit('existing-producers', existingProducers);
+
+      // Return via callback
+      callback({ params: existingProducers });
     } catch (e) {
       trace('socket', 'request-existing-producers failed', e);
+      callback({ error: e.message, params: [] });
     }
   });
+
 
   socket.on('leave-room', async () => {
     trace('leave', `leave-room called by ${socket.id}`);
