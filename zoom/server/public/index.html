@@ -20,35 +20,90 @@ h1 { margin: 20px; }
 }
 input { margin: 0 5px; padding: 5px; border-radius: 4px; border: none; }
 button { padding: 5px 10px; margin: 0 5px; border-radius: 4px; border: none; cursor: pointer; background:#38bdf8; color:#000; font-weight:bold; }
+body {
+  background-color: #0d0d0d;
+  margin: 0;
+  font-family: sans-serif;
+  color: white;
+  overflow: hidden;
+}
+
 #videos {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
-  gap: 10px;
-  width: 90%;
-  max-width: 1200px;
-  margin-top: 20px;
+  place-items: center;
+  width: 100vw;
+  height: calc(100vh - 80px); /* leave space for header/controls */
+  gap: 12px;
+  padding: 12px;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  grid-auto-rows: 1fr;
+  justify-items: center;
+  align-items: center;
 }
+
 .video-container {
   position: relative;
+  width: 50%;
+  aspect-ratio: 16 / 9;
+  background: black;
+  border-radius: 16px;
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.2s ease;
 }
-video {
+
+.video-container video {
   width: 100%;
-  border: 2px solid #38bdf8;
-  border-radius: 8px;
+  height: 100%;
+  object-fit: cover;
 }
-.name-label {
+
+.video-container .fallback {
   position: absolute;
-  bottom: 5px;
+  top: 0;
   left: 0;
   right: 0;
-  text-align: center;
-  font-size: 14px;
-  font-weight: bold;
-  color: #fff;
-  background: rgba(0,0,0,0.5);
-  padding: 2px 0;
-  border-radius: 0 0 8px 8px;
+  bottom: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.8);
+  color: #ccc;
+  font-size: 0.9rem;
 }
+
+.video-container .name-label {
+  position: absolute;
+  bottom: 6px;
+  left: 10px;
+  font-weight: 600;
+  background: rgba(0, 0, 0, 0.5);
+  padding: 2px 6px;
+  border-radius: 6px;
+  font-size: 0.85rem;
+}
+
+.video-container .audio-indicator {
+  position: absolute;
+  top: 6px;
+  right: 10px;
+  font-size: 1.2rem;
+}
+
+@media (min-width: 1600px) {
+  #videos {
+    grid-template-columns: repeat(auto-fit, minmax(400px, 1fr));
+  }
+}
+
+@media (max-width: 768px) {
+  #videos {
+    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  }
+}
+
 .active-speaker {
   border-color: #facc15 !important;
   box-shadow: 0 0 15px #facc15;

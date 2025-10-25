@@ -29,6 +29,8 @@ services:
     environment:
       NODE_ENV: development
       INSTANCE_ID: 1
+    ports:
+    - "3000:3000"
     # depends_on:
     #   - kafka1
     # command: sh -c "./wait-for-it.sh kafka1:9094 -- node index.js"
@@ -68,21 +70,21 @@ services:
       - hyperion_network
 
 
-  caddy:
-    build: 
-      context: .
-      dockerfile: Dockerfile.caddy
-    ports:
-      - "80:80"
-      - "443:443"
-    volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile
-      - caddy_data:/data
-      - caddy_config:/config
-    networks:
-      - hyperion_network
-    depends_on:
-      - signaling1
+  # caddy:
+  #   build: 
+  #     context: .
+  #     dockerfile: Dockerfile.caddy
+  #   ports:
+  #     - "80:80"
+  #     - "443:443"
+  #   volumes:
+  #     - ./Caddyfile:/etc/caddy/Caddyfile
+  #     - caddy_data:/data
+  #     - caddy_config:/config
+  #   networks:
+  #     - hyperion_network
+  #   depends_on:
+  #     - signaling1
 
 
 volumes:

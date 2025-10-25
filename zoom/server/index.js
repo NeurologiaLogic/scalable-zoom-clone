@@ -203,19 +203,27 @@ io.on('connection', (socket) => {
     }
   });
 
-  socket.on('connect-transport', async ({ roomId, transportId, dtlsParameters }) => {
+  // Backend socket handler
+  socket.on('connect-transport', ({ roomId, transportId, dtlsParameters }, callback) => {
     trace('transport', `connect-transport called for transport=${transportId} room=${roomId} by ${socket.id}`);
-    try {
-      const transport = localTransports[roomId][transportId];
-      if (!transport) throw new Error('transport object not found');
-      await transport.connect({ dtlsParameters });
-      socket.emit('connect-transport-ok', { transportId });
-      trace('transport', `transport connected ${transportId}`);
-    } catch (e) {
-      trace('transport', 'connect-transport failed', e);
-      socket.emit('connect-transport-failed', { reason: e.message });
+
+    const transport = localTransports[roomId][transportId];
+    if (!transport) {
+      trace('transport', 'transport object not found');
+      return callback({ error: 'transport object not found' });
     }
+
+    transport.connect({ dtlsParameters })
+      .then(() => {
+        trace('transport', `transport connected ${transportId}`);
+        callback({ success: true });  // ✅ callback indicates success
+      })
+      .catch(err => {
+        trace('transport', 'connect-transport failed', err);
+        callback({ error: err.message });  // ✅ callback indicates failure
+      });
   });
+
 
   socket.on('produce', async ({ roomId, kind, rtpParameters }, ack) => {
     trace('produce', `produce() from ${socket.id} kind=${kind} room=${roomId}`);
