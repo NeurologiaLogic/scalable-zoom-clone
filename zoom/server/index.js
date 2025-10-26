@@ -43,14 +43,22 @@ function trace(tag, msg, data) {
 
 async function spawnWorker() {
   trace('worker', 'creating mediasoup worker');
-  const worker = await mediasoup.createWorker();
+  const worker = await mediasoup.createWorker({
+    logLevel: 'warn',
+    logTags: ['info', 'ice', 'dtls', 'rtp', 'srtp', 'rtcp'],
+    rtcMinPort: 10000,
+    rtcMaxPort: 10100
+  });
+
   worker.on('died', () => {
     trace('worker', 'worker died, respawning in 2s');
     setTimeout(() => spawnWorker().catch(e => console.error(e)), 2000);
   });
+
   workers.push(worker);
   trace('worker', 'worker spawned');
 }
+
 
 (async () => {
   const num = Math.max(1, Math.floor(os.cpus().length / 3));
@@ -80,15 +88,21 @@ function getLocalIPv4() {
   }
   return '127.0.0.1';
 }
-
+const localIp = getLocalIPv4();
+const announcedIp = process.env.ANNOUNCED_IP || localIp;
 async function createWebRtcTransport(router, { direction, peerId }) {
   trace('transport', `createWebRtcTransport direction=${direction} peerId=${peerId}`);
   const transport = await router.createWebRtcTransport({
-    listenIps: [{ ip: '0.0.0.0', announcedIp: process.env.ANNOUNCED_IP || getLocalIPv4() }],
+    listenIps: [{ ip: '0.0.0.0', announcedIp: announcedIp }],
     enableUdp: true,
     enableTcp: true,
     preferUdp: true,
-    appData: { direction, peerId }
+    appData: { direction, peerId },
+    // ✅ add ICE servers here
+    iceServers: [
+      { urls: 'stun:stun.l.google.com:19302' },
+      // { urls: 'turn:YOUR_TURN_SERVER', username: 'user', credential: 'pass' }, // optional TURN
+    ],
   });
   trace('transport', `created transport id=${transport.id}`);
   return transport;
@@ -156,7 +170,10 @@ io.on('connection', (socket) => {
     trace('join', `join requested by ${socket.id} name=${peerName} room=${roomId}`);
     try {
       if (!localRouters[roomId]) {
-        const router = await assignWorker().createRouter({ mediaCodecs: getCodecs() });
+        const router = await assignWorker().createRouter({ mediaCodecs: getCodecs(),// ⚡ Add ICE servers here
+          iceServers: [
+            { urls: 'stun:stun.l.google.com:19302' },
+          ], });
         localRouters[roomId] = router;
         localTransports[roomId] = {};
         localProducers[roomId] = {};
@@ -298,6 +315,15 @@ io.on('connection', (socket) => {
       await safeUpdatePeer(roomId, socket.id, peer => peer.consumers.push(consumer.id));
       trace('consume', `consumer created id=${consumer.id} for producer ${producerId}`);
 
+      callback({
+        params: {
+          id: consumer.id,
+          producerId:consumer.producerId,
+          kind: consumer.kind,
+          rtpParameters: consumer.rtpParameters
+        }
+      });
+
       await consumer.resume();
            
       if (consumer.kind === 'video') {
@@ -308,14 +334,6 @@ io.on('connection', (socket) => {
           trace('consume', 'Keyframe request failed', e);
         }
       }
-      callback({
-        params: {
-          id: consumer.id,
-          producerId:consumer.producerId,
-          kind: consumer.kind,
-          rtpParameters: consumer.rtpParameters
-        }
-      });
     } catch (e) {
       trace('consume', 'consume error', e);
       callback({ error: e.message, params: null });

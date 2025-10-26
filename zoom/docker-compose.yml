@@ -29,13 +29,16 @@ services:
     environment:
       NODE_ENV: development
       INSTANCE_ID: 1
+      ANNOUNCED_IP: 192.168.18.7
     ports:
     - "3000:3000"
+    - "10000-10100:10000-10100/udp" # ⬅️ CRITICAL: You MUST expose the UDP ports
     # depends_on:
     #   - kafka1
     # command: sh -c "./wait-for-it.sh kafka1:9094 -- node index.js"
     networks:
       - hyperion_network
+    
 
   # signaling2:
   #   build: ./server

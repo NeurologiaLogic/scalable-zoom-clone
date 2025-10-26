@@ -136,6 +136,7 @@ function produceLocalTracks() {
 }
 
 // ------------------- Consume Producer -------------------
+// ------------------- Consume Producer -------------------
 function consumeProducer(producerId, peerId, peerName) {
   if (!recvTransport) return log('consume', 'recvTransport not ready');
 
@@ -193,28 +194,55 @@ function consumeProducer(producerId, peerId, peerName) {
       if (response.params.kind === 'video') {
         let video = container.querySelector('video');
         if (!video) {
-          video = document.createElement('video');
-          video.autoplay = true;
+          video = document.createElement('video'); // ✅ create video
+          // video.src = 'https://storage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4';
+          video.muted = true; // allow autoplay
           video.playsInline = true;
-          video.muted = false;
+          video.autoplay = true;     // ✅ add this
           video.style.width = '100%';
           video.style.height = '100%';
           video.style.objectFit = 'cover';
-          container.appendChild(video);
-
-          // Create persistent MediaStream
-          video.srcObject = new MediaStream();
+          container.appendChild(video); // ✅ append to DOM
         }
+        
+        // For real Mediasoup usage, uncomment this:
+        // Create a new MediaStream for this consumer
+        const stream = new MediaStream();
+        stream.addTrack(consumer.track);
+        video.srcObject = stream;
+        console.log('video element muted:', video.muted);
+        console.log('video element autoplay:', video.autoplay);
+        console.log('track muted:', consumer.track.muted);
+        console.log('Stream tracks:', stream.getTracks());
+        console.log('Audio tracks:', stream.getAudioTracks());
+        console.log('Video tracks:', stream.getVideoTracks());
+        stream.getTracks().forEach(track => {
+          console.log(track.kind, 'readyState:', track.readyState, 'muted:', track.muted);
+        });
+        function checkFrames(video) {
+            let lastTime = 0;
+            function loop() {
+              if (video.readyState >= 2) { // HAVE_CURRENT_DATA
+                if (video.currentTime !== lastTime) {
+                  console.log('Video is playing frame', video.currentTime);
+                  lastTime = video.currentTime;
+                }
+              }
+              requestAnimationFrame(loop);
+            }
+            loop();
+          }
 
-        // Add the track
-        video.srcObject.addTrack(consumer.track);
-        video.muted = true; // allow autoplay
+        checkFrames(video);
+
+
         video.play().catch(console.warn);
         video.onloadedmetadata = () => {
           video.play().catch(e => console.warn('Autoplay blocked', e));
           container.style.background = 'transparent';
           console.log('[consume] video playing');
         };
+
       } else if (response.params.kind === 'audio') {
         let audio = container.querySelector('audio');
         if (!audio) {
@@ -230,6 +258,7 @@ function consumeProducer(producerId, peerId, peerName) {
     }
   );
 }
+
 
 
 // ------------------- Existing Producers -------------------
