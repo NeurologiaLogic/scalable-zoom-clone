@@ -24,6 +24,24 @@ services:
   #   networks:
   #     - hyperion_network
 
+  # kafka2:
+  #   image: wurstmeister/kafka:latest
+  #   container_name: kafka2
+  #   ports:
+  #     - "9095:9095"  # Host port 9094 -> OUTSIDE listener
+  #   environment:
+  #     KAFKA_BROKER_ID: 1
+  #     KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+  #     KAFKA_LISTENERS: INSIDE://kafka2:9092,OUTSIDE://kafka2:9094
+  #     KAFKA_ADVERTISED_LISTENERS: INSIDE://kafka2:9092,OUTSIDE://kafka2:9094
+  #     KAFKA_INTER_BROKER_LISTENER_NAME: INSIDE
+  #     KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INSIDE:PLAINTEXT,OUTSIDE:PLAINTEXT
+  #     KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
+  #   depends_on:
+  #     - zookeeper
+  #   networks:
+  #     - hyperion_network
+  
   signaling1:
     build: ./server
     environment:

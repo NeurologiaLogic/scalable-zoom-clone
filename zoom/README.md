@@ -11,7 +11,7 @@ This repository contains a minimal scaffold for **Project Hyperion** using **med
 
 1. Build and run the backend:
 ```bash
-add '127.0.0.1 zoom.app' to 'C:\Windows\System32\drivers\etc\hosts' -> for ssl
+configure ANNOUNCED_IP to the public IP or Local IPv4
 docker compose up --build
 ```
 
@@ -20,7 +20,7 @@ docker compose up --build
 cd ./zoom/electron && npm run start
 ```
 
-3. Open the UI at `http://localhost:4000` and click **Join Room**.
+3. Open the UI at `http://localhost:3000` and click **Join Room**.
 
 <!-- ## Notes & Next Steps
 - `mediasoup` requires native build tools and must be configured with real network settings, ICE servers, and transports. The server scaffold shows where to integrate mediasoup worker/router/transport logic.

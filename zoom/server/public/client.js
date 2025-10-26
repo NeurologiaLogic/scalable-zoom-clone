@@ -236,7 +236,7 @@ function consumeProducer(producerId, peerId, peerName) {
         checkFrames(video);
 
 
-        video.play().catch(console.warn);
+        // video.play().catch(console.warn);
         video.onloadedmetadata = () => {
           video.play().catch(e => console.warn('Autoplay blocked', e));
           container.style.background = 'transparent';
